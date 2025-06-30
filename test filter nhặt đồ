@@ -1,0 +1,262 @@
+import io.socket.emitter.Emitter;
+import jsclub.codefest.sdk.Hero;
+import jsclub.codefest.sdk.algorithm.PathUtils;
+import jsclub.codefest.sdk.base.Node;
+import jsclub.codefest.sdk.model.Element;
+import jsclub.codefest.sdk.model.ElementType;
+import jsclub.codefest.sdk.model.GameMap;
+import jsclub.codefest.sdk.model.Inventory;
+import jsclub.codefest.sdk.model.equipments.Armor;
+import jsclub.codefest.sdk.model.equipments.HealingItem;
+import jsclub.codefest.sdk.model.obstacles.Obstacle;
+import jsclub.codefest.sdk.model.players.Player;
+import jsclub.codefest.sdk.model.weapon.Weapon;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+class MapUpdateListener implements Emitter.Listener {
+    private final Hero hero;
+
+    public MapUpdateListener(Hero hero) {
+        this.hero = hero;
+    }
+
+    @Override
+    public void call(Object... args) {
+        try {
+            if (args == null || args.length == 0) return;
+
+            GameMap gameMap = hero.getGameMap();
+            gameMap.updateOnUpdateMap(args[0]);
+            Player player = gameMap.getCurrentPlayer();
+
+            if (player == null || player.getHealth() == 0) {
+                System.out.println("Player is dead or data is not available.");
+                return;
+            }
+
+            List<Node> nodesToAvoid = getNodesToAvoid(gameMap);
+
+            if (hero.getInventory().getGun() == null) {
+                handleSearchForGun(gameMap, player, nodesToAvoid);
+            }
+
+            if (hero.getInventory().getMelee() == null) {
+                handleSearchForMelee(gameMap, player, nodesToAvoid);
+            }
+
+            if (hero.getInventory().getThrowable() == null) {
+                handleSearchForThrowable(gameMap, player, nodesToAvoid);
+            }
+
+            handleSearchForChest(gameMap, player, nodesToAvoid);
+
+        } catch (Exception e) {
+            System.err.println("Critical error in call method: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private List<Node> getNodesToAvoid(GameMap gameMap) {
+        List<Node> nodes = new ArrayList<>(gameMap.getListIndestructibles());
+        nodes.removeAll(gameMap.getObstaclesByTag("CAN_GO_THROUGH"));
+        nodes.addAll(gameMap.getOtherPlayerInfo());
+        return nodes;
+    }
+
+    // === GUN ===
+    private void handleSearchForGun(GameMap gameMap, Player player, List<Node> nodesToAvoid) throws IOException {
+        System.out.println("No gun found. Searching for a gun.");
+        String path = findPathToWeapon(gameMap.getAllGun(), gameMap, nodesToAvoid, player);
+
+        if (path != null) {
+            if (path.isEmpty()) {
+                hero.pickupItem();
+            } else {
+                hero.move(path);
+            }
+        }
+    }
+
+    // === MELEE ===
+    private void handleSearchForMelee(GameMap gameMap, Player player, List<Node> nodesToAvoid) throws IOException {
+        System.out.println("No melee weapon found. Searching for a melee.");
+        String path = findPathToWeapon(gameMap.getAllMelee(), gameMap, nodesToAvoid, player);
+
+        if (path != null) {
+            if (path.isEmpty()) {
+                hero.pickupItem();
+            } else {
+                hero.move(path);
+            }
+        }
+    }
+
+    // === THROWABLE ===
+    private void handleSearchForThrowable(GameMap gameMap, Player player, List<Node> nodesToAvoid) throws IOException {
+        System.out.println("No throwable found. Searching for a throwable.");
+        String path = findPathToWeapon(gameMap.getAllThrowable(), gameMap, nodesToAvoid, player);
+
+        if (path != null) {
+            if (path.isEmpty()) {
+                hero.pickupItem();
+            } else {
+                hero.move(path);
+            }
+        }
+    }
+
+    // === CHEST ===
+    private void handleSearchForChest(GameMap gameMap, Player player, List<Node> nodesToAvoid) throws IOException {
+        List<Obstacle> chests = gameMap.getListChests();
+        if (chests.isEmpty()) return;
+
+        Obstacle targetChest = getPreferredChest(chests, player);
+        if (targetChest == null) return;
+
+        int dx = targetChest.getX() - player.getX();
+        int dy = targetChest.getY() - player.getY();
+
+        if (Math.abs(dx) + Math.abs(dy) == 1) {
+            String direction = getAttackDirection(dx, dy);
+            if (direction != null) {
+                hero.attack(direction);
+            }
+        } else {
+            String path = PathUtils.getShortestPath(gameMap, nodesToAvoid, player, targetChest, false);
+            if (path != null) {
+                hero.move(path);
+            }
+        }
+    }
+
+    private Obstacle getPreferredChest(List<Obstacle> chests, Player player) {
+        Obstacle preferred = null;
+        Obstacle fallback = null;
+        double minPreferredDist = Double.MAX_VALUE;
+        double minFallbackDist = Double.MAX_VALUE;
+
+        for (Obstacle chest : chests) {
+            double dist = PathUtils.distance(player, chest);
+            if ("DRAGON_EGG".equals(chest.getId())) {
+                if (dist < minPreferredDist) {
+                    minPreferredDist = dist;
+                    preferred = chest;
+                }
+            } else {
+                if (dist < minFallbackDist) {
+                    minFallbackDist = dist;
+                    fallback = chest;
+                }
+            }
+        }
+
+        return preferred != null ? preferred : fallback;
+    }
+
+    private void handlePickupAfterChestBreak(GameMap gameMap, Hero hero, int chestX, int chestY) {
+        List<Element> dropped = getElementsAt(gameMap, chestX, chestY);
+        Inventory inv = hero.getInventory();
+
+        for (Element item : dropped) {
+            if (isBetterThanInventory(item, inv)) {
+                System.out.println("Picking up better item: " + item.getId());
+                try {
+                    hero.pickupItem();
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+            }
+        }
+    }
+
+    private List<Element> getElementsAt(GameMap gameMap, int x, int y) {
+        List<Element> result = new ArrayList<>();
+
+        for (Weapon w : gameMap.getListWeapons()) {
+            if (w.getX() == x && w.getY() == y) result.add(w);
+        }
+        for (Armor a : gameMap.getListArmors()) {
+            if (a.getX() == x && a.getY() == y) result.add(a);
+        }
+        for (HealingItem h : gameMap.getListHealingItems()) {
+            if (h.getX() == x && h.getY() == y) result.add(h);
+        }
+
+        return result;
+    }
+
+
+
+    private String getAttackDirection(int dx, int dy) {
+        if (dx == 1 && dy == 0) return "r";
+        if (dx == -1 && dy == 0) return "l";
+        if (dx == 0 && dy == 1) return "u";
+        if (dx == 0 && dy == -1) return "d";
+        return null;
+    }
+
+
+    // === SHARED METHOD ===
+    private String findPathToWeapon(List<Weapon> weapons, GameMap gameMap, List<Node> nodesToAvoid, Player player) {
+        Weapon nearestWeapon = getNearestWeapon(weapons, player);
+        if (nearestWeapon == null) return null;
+        return PathUtils.getShortestPath(gameMap, nodesToAvoid, player, nearestWeapon, false);
+    }
+
+    private Weapon getNearestWeapon(List<Weapon> weapons, Player player) {
+        Weapon nearest = null;
+        double minDistance = Double.MAX_VALUE;
+
+        for (Weapon weapon : weapons) {
+            double distance = PathUtils.distance(player, weapon);
+            if (distance < minDistance) {
+                minDistance = distance;
+                nearest = weapon;
+            }
+        }
+        return nearest;
+    }
+
+    private boolean isBetterThanInventory(Element item, Inventory inv) {
+        ElementType type = item.getType();
+
+        if (item instanceof Weapon w) {
+            Weapon current = switch (type) {
+                case GUN -> inv.getGun();
+                case MELEE -> inv.getMelee();
+                case THROWABLE -> inv.getThrowable();
+                case SPECIAL -> inv.getSpecial();
+                default -> null;
+            };
+            return current == null || w.getDamage() > current.getDamage();
+        }
+
+        if (item instanceof Armor a) {
+            boolean isHelmet = a.getType() == ElementType.HELMET;
+            Armor current = isHelmet ? inv.getHelmet() : inv.getArmor();
+
+            if (current == null) return true;
+
+            // Ưu tiên giáp có nhiều HP hơn, nếu bằng nhau thì ưu tiên damageReduce
+            if (a.getHealthPoint() > current.getHealthPoint()) return true;
+            if (a.getHealthPoint() == current.getHealthPoint() &&
+                    a.getDamageReduce() > current.getDamageReduce()) return true;
+
+            return false;
+        }
+
+        if (item instanceof HealingItem) {
+            // Có thể nâng cấp thêm: kiểm tra loại, giá trị hồi máu nếu cần
+            return true;
+        }
+
+        return false;
+    }
+
+
+
+}
